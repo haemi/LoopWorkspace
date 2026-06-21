@@ -1,0 +1,114 @@
+name: 5. Every 80 Days Build
+run-name: Every-80-days scheduler (${{ github.ref_name }})
+
+# Triggers a forced "Build Loop" exactly every 80 days starting 2026-06-21,
+# so a fresh TestFlight build always exists well before the 90-day expiry.
+#
+# How it works:
+#   * Runs once a day. A date-gate decides whether today is an 80-day boundary.
+#   * On a build day it first syncs the fork from upstream Loop (latest main),
+#     then dispatches the "4. Build Loop" workflow (which force-builds on
+#     workflow_dispatch and uploads to TestFlight).
+#   * On non-build days it does nothing, except a lightweight keep-alive commit
+#     if the repo has been quiet for >=45 days. GitHub auto-disables scheduled
+#     workflows after 60 days of repo inactivity; the keep-alive prevents that.
+#
+# The built-in weekly auto-build is turned OFF via the repo variables
+# SCHEDULED_BUILD=false and SCHEDULED_SYNC=false, so builds happen ONLY here,
+# i.e. exactly every 80 days.
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force a build right now, ignoring the 80-day schedule"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "30 8 * * *" # daily 08:30 UTC; the gate below decides what to do
+
+env:
+  ANCHOR_DATE: "2026-06-21" # first build day
+  INTERVAL_DAYS: "80"
+
+jobs:
+  schedule-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Decide whether today is an 80-day build day
+        id: gate
+        run: |
+          set -euo pipefail
+          today=$(date -u +%Y-%m-%d)
+          anchor_epoch=$(date -u -d "$ANCHOR_DATE" +%s)
+          today_epoch=$(date -u -d "$today" +%s)
+          diff_days=$(( (today_epoch - anchor_epoch) / 86400 ))
+          echo "Today (UTC): $today"
+          echo "Days since anchor $ANCHOR_DATE: $diff_days"
+
+          build=false
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "Manual force requested -> building now."
+            build=true
+          elif [ "$diff_days" -ge 0 ] && [ $(( diff_days % INTERVAL_DAYS )) -eq 0 ]; then
+            echo "Today IS an 80-day build day -> building."
+            build=true
+          else
+            rem=$(( diff_days % INTERVAL_DAYS ))
+            next=$(( INTERVAL_DAYS - rem ))
+            echo "Not a build day. Next scheduled build in $next day(s)."
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+      - name: Sync fork main from upstream Loop (latest Loop 3)
+        if: steps.gate.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          echo "Syncing fork from upstream LoopKit/LoopWorkspace ..."
+          gh api -X POST "repos/${{ github.repository }}/merge-upstream" \
+            -f branch=main \
+            && echo "Fork synced." \
+            || echo "merge-upstream non-zero (likely already up to date) - continuing."
+
+      - name: Dispatch Build Loop (force build -> TestFlight)
+        if: steps.gate.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          gh workflow run build_loop.yml -R "${{ github.repository }}" --ref main
+          echo "Dispatched '4. Build Loop'. It builds and uploads to TestFlight (~20-30 min)."
+
+      - name: Keep-alive (avoid 60-day scheduled-workflow auto-disable)
+        if: steps.gate.outputs.build != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          last=$(git log -1 --format=%ct origin/main)
+          now=$(date -u +%s)
+          age_days=$(( (now - last) / 86400 ))
+          echo "Most recent commit is $age_days day(s) old."
+          if [ "$age_days" -lt 45 ]; then
+            echo "Repo active enough; no keep-alive needed."
+            exit 0
+          fi
+          echo "Repo quiet for >=45 days; pushing keep-alive commit."
+          mkdir -p .automation
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .automation/last-checked.txt
+          git config user.name "loop-80day-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add .automation/last-checked.txt
+          git commit -m "chore: 80-day scheduler keep-alive [skip ci]"
+          git push origin HEAD:main
