@@ -1,21 +1,31 @@
 name: 5. Every 80 Days Build
 run-name: Every-80-days scheduler (${{ github.ref_name }})
 
-# Triggers a forced "Build Loop" exactly every 80 days starting 2026-06-21,
-# so a fresh TestFlight build always exists well before the 90-day expiry.
+# Ensures a fresh TestFlight build always exists well before Apple's 90-day
+# expiry by building at least every 80 days.
 #
 # How it works:
-#   * Runs once a day. A date-gate decides whether today is an 80-day boundary.
+#   * Runs once a day. A gate decides whether a build is DUE.
+#   * "Due" = it has been >= INTERVAL_DAYS since the last REAL build.
+#     A real build is a *successful workflow_dispatch* run of "4. Build Loop"
+#     (that is exactly what this scheduler triggers). The built-in weekly
+#     "schedule" runs of Build Loop only run the check job and SKIP the actual
+#     build (repo vars SCHEDULED_BUILD=false, SCHEDULED_SYNC=false), so they are
+#     deliberately NOT counted here.
 #   * On a build day it first syncs the fork from upstream Loop (latest main),
-#     then dispatches the "4. Build Loop" workflow (which force-builds on
-#     workflow_dispatch and uploads to TestFlight).
+#     then dispatches "4. Build Loop" (which force-builds on workflow_dispatch
+#     and uploads to TestFlight).
 #   * On non-build days it does nothing, except a lightweight keep-alive commit
 #     if the repo has been quiet for >=45 days. GitHub auto-disables scheduled
 #     workflows after 60 days of repo inactivity; the keep-alive prevents that.
 #
-# The built-in weekly auto-build is turned OFF via the repo variables
-# SCHEDULED_BUILD=false and SCHEDULED_SYNC=false, so builds happen ONLY here,
-# i.e. exactly every 80 days.
+# Why "days since last build" instead of "exact 80-day multiple":
+#   GitHub may delay or drop scheduled runs under load. An exact-day gate would
+#   miss the boundary entirely and not build again for another 80 days. This
+#   window-based gate AUTOMATICALLY CATCHES UP: if the 80th day is missed, the
+#   next daily run still sees days_since >= 80 and builds. It also never
+#   double-builds (a fresh successful build resets days_since to ~0) and skips
+#   while a build is already queued/running.
 
 on:
   workflow_dispatch:
@@ -28,7 +38,7 @@ on:
     - cron: "30 8 * * *" # daily 08:30 UTC; the gate below decides what to do
 
 env:
-  ANCHOR_DATE: "2026-06-21" # first build day
+  ANCHOR_DATE: "2026-06-21" # earliest allowed build (used only if no build exists yet)
   INTERVAL_DAYS: "80"
 
 jobs:
@@ -44,30 +54,64 @@ jobs:
           token: ${{ secrets.GH_PAT }}
           fetch-depth: 0
 
-      - name: Decide whether today is an 80-day build day
+      - name: Decide whether a build is due (>= 80 days since last real build)
         id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
+          repo="${{ github.repository }}"
           today=$(date -u +%Y-%m-%d)
-          anchor_epoch=$(date -u -d "$ANCHOR_DATE" +%s)
-          today_epoch=$(date -u -d "$today" +%s)
-          diff_days=$(( (today_epoch - anchor_epoch) / 86400 ))
-          echo "Today (UTC): $today"
-          echo "Days since anchor $ANCHOR_DATE: $diff_days"
+          today_epoch=$(date -u -d "$today" +%s) # midnight UTC today, for calendar-day math
 
-          build=false
           if [ "${{ inputs.force }}" = "true" ]; then
             echo "Manual force requested -> building now."
-            build=true
-          elif [ "$diff_days" -ge 0 ] && [ $(( diff_days % INTERVAL_DAYS )) -eq 0 ]; then
-            echo "Today IS an 80-day build day -> building."
-            build=true
-          else
-            rem=$(( diff_days % INTERVAL_DAYS ))
-            next=$(( INTERVAL_DAYS - rem ))
-            echo "Not a build day. Next scheduled build in $next day(s)."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+          # Never stack builds: if one is already queued or running, wait.
+          active=$(gh run list -R "$repo" --workflow=build_loop.yml -L 20 \
+            --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length')
+          if [ "${active:-0}" -gt 0 ]; then
+            echo "A '4. Build Loop' run is already in progress/queued -> not dispatching."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A REAL build = a successful workflow_dispatch run of Build Loop.
+          # (Scheduled Build Loop runs skip the Build job, so they are ignored.)
+          last_build=$(gh run list -R "$repo" --workflow=build_loop.yml \
+            --event=workflow_dispatch --status=success -L 1 \
+            --json createdAt --jq '.[0].createdAt // empty')
+
+          if [ -z "$last_build" ]; then
+            # No real build has ever succeeded -> bootstrap, but not before the anchor.
+            anchor_epoch=$(date -u -d "$ANCHOR_DATE" +%s)
+            if [ "$today_epoch" -ge "$anchor_epoch" ]; then
+              echo "No prior successful build found -> bootstrap build."
+              echo "build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Before anchor $ANCHOR_DATE -> no build yet."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          # Count whole CALENDAR days between the last build's date and today, so
+          # cadence lands on the exact 80th day regardless of build time-of-day.
+          last_date=$(date -u -d "$last_build" +%Y-%m-%d)
+          last_epoch=$(date -u -d "$last_date" +%s)
+          days_since=$(( (today_epoch - last_epoch) / 86400 ))
+          echo "Last successful build: $last_build (${days_since} calendar day(s) ago)."
+
+          if [ "$days_since" -ge "$INTERVAL_DAYS" ]; then
+            echo "It has been >= $INTERVAL_DAYS days -> building now (auto-catch-up if a day was missed)."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not due yet. Next build in $(( INTERVAL_DAYS - days_since )) day(s)."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Sync fork main from upstream Loop (latest Loop 3)
         if: steps.gate.outputs.build == 'true'
